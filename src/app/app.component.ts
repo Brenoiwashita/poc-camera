@@ -12,7 +12,6 @@ import { switchMap, tap, catchError, concatMap, map, filter, take, finalize } fr
     <div class="cam-wrapper" (dragover)="$event.preventDefault()" (drop)="$event.preventDefault()" (paste)="$event.preventDefault()">
       <div *ngIf="!streamAtivo" class="start">
         <button (click)="iniciarCamera().subscribe()">Abrir câmera</button>
-        <p class="hint">A câmera é obrigatória para o laudo (não aceitamos upload da galeria).</p>
       </div>
 
       <div *ngIf="streamAtivo" class="cam-area">
