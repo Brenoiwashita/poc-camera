@@ -20,7 +20,7 @@ jobs:
           node-version: 20
 
       - name: Install deps
-        run: npm ci
+        run: npm install --force
 
       - name: Build (base-href para subpasta do repo)
         run: npm run build -- --configuration production --base-href=/poc-camera/
