@@ -1,8 +1,30 @@
-import { Component, ElementRef, ViewChild, OnDestroy, Input } from '@angular/core';
+import { Component, ElementRef, ViewChild, OnDestroy, OnInit, Input } from '@angular/core';
 import { NgIf, DatePipe, DecimalPipe } from '@angular/common';
 import { HttpClient, HttpClientModule } from '@angular/common/http';
-import { from, of, Observable, defer, timer, throwError } from 'rxjs';
+import { from, of, Observable, defer, timer, throwError, forkJoin } from 'rxjs';
 import { switchMap, tap, catchError, concatMap, map, filter, take, finalize } from 'rxjs/operators';
+
+// ===== Tipos globais para proofs/score =====
+type OrientationSample = { alpha: number|null; beta: number|null; gamma: number|null } | null;
+interface MobileContextProofs {
+  cameraActive: boolean;
+  cameraFacingMode?: string;
+  cameraResolution?: { width?: number; height?: number };
+
+  orientationOk: boolean;
+  orientationSample?: OrientationSample;
+
+  touchOk: boolean;
+  coarsePointer: boolean;
+
+  geoOk: boolean;
+  geoAccuracy?: number;
+
+  camerasCount?: number;
+  vibrateSupport: boolean;
+  screenOrientation?: string | undefined;
+  connectionType?: string | undefined;
+}
 
 @Component({
   selector: 'app-root',
@@ -11,7 +33,49 @@ import { switchMap, tap, catchError, concatMap, map, filter, take, finalize } fr
   template: `
     <div class="cam-wrapper" (dragover)="$event.preventDefault()" (drop)="$event.preventDefault()" (paste)="$event.preventDefault()">
       <div *ngIf="!streamAtivo" class="start">
-        <button (click)="iniciarCamera().subscribe()">Abrir câmera</button>
+        <button (click)="iniciarCamera().subscribe()" [disabled]="scoreOk !== true">Abrir câmera</button>
+        <button (click)="avaliarMobile()">Testar score de dispositivo</button>
+      </div>
+
+      <div class="score-panel">
+        <h3>Verificação de dispositivo</h3>
+        <div class="score-row">
+          <div class="score-box" [class.ok]="scoreOk === true" [class.bad]="scoreOk === false">
+            <div class="score-value">{{ score !== undefined ? (score | number:'1.1-1') : '--' }}</div>
+            <div class="score-label">Score</div>
+          </div>
+          <div class="score-status">
+            <span *ngIf="scoreOk === true">Aprovado como dispositivo móvel ✅</span>
+            <span *ngIf="scoreOk === false">Reprovado (não aparenta ser um dispositivo móvel) ❌</span>
+            <span *ngIf="scoreOk === undefined">Clique em "Testar score de dispositivo" para avaliar.</span>
+          </div>
+        </div>
+
+        <details class="score-explain">
+          <summary>Como o score é calculado?</summary>
+          <ul>
+            <li><b>+2</b> câmera ativa com traseira (<code>facingMode=environment</code>) ou orientação retrato (altura ≥ largura)</li>
+            <li><b>+1</b> sensores de orientação entregando valores (alpha/beta/gamma)</li>
+            <li><b>+1</b> toque habilitado <i>e</i> ponteiro "coarse"</li>
+            <li><b>+1</b> geolocalização de alta precisão (&lt; 70m)</li>
+            <li><b>+1</b> duas ou mais câmeras detectadas</li>
+            <li><b>+0.5</b> suporte a vibração</li>
+            <li><b>+0.5</b> orientação de tela em portrait</li>
+          </ul>
+          <p><b>Aprovação:</b> score ≥ 4.</p>
+        </details>
+
+        <div class="proofs" *ngIf="proofs">
+          <h4>Provas coletadas</h4>
+          <ul>
+            <li>Câmera: ativa={{ proofs.cameraActive }} | facing={{ proofs.cameraFacingMode || '-' }} | res={{ proofs.cameraResolution?.width || '?' }}x{{ proofs.cameraResolution?.height || '?' }}</li>
+            <li>Orientação: ok={{ proofs.orientationOk }} | amostra={{ proofs.orientationSample ? 'sim' : 'não' }}</li>
+            <li>Toque/Ponteiro: touch={{ proofs.touchOk }} | coarse={{ proofs.coarsePointer }}</li>
+            <li>Geo: ok={{ proofs.geoOk }} | accuracy={{ proofs.geoAccuracy !== undefined ? (proofs.geoAccuracy | number:'1.0-0') + 'm' : '-' }}</li>
+            <li>Câmeras detectadas: {{ proofs.camerasCount ?? '-' }}</li>
+            <li>Extras: vibrate={{ proofs.vibrateSupport }} | screen={{ proofs.screenOrientation || '-' }} | conn={{ proofs.connectionType || '-' }}</li>
+          </ul>
+        </div>
       </div>
 
       <div *ngIf="streamAtivo" class="cam-area">
@@ -39,9 +103,19 @@ import { switchMap, tap, catchError, concatMap, map, filter, take, finalize } fr
     .meta { font-size:12px; opacity:.8; display:flex; flex-wrap:wrap; gap:8px; }
     .preview { width:100%; max-width:600px; border:1px solid #ddd; border-radius:12px; }
     .hint { font-size:12px; opacity:.8; }
+    .score-panel { border:1px solid #e5e5e5; border-radius:12px; padding:12px; margin-bottom:12px; }
+    .score-row { display:flex; align-items:center; gap:16px; }
+    .score-box { width:96px; height:96px; border-radius:12px; display:flex; flex-direction:column; align-items:center; justify-content:center; background:#fafafa; border:1px solid #ddd; }
+    .score-box.ok { border-color:#16a34a; background:#f0fdf4; }
+    .score-box.bad { border-color:#dc2626; background:#fef2f2; }
+    .score-value { font-size:28px; font-weight:700; }
+    .score-label { font-size:12px; opacity:.7; }
+    .score-status { font-size:14px; }
+    .score-explain { margin-top:8px; }
+    .proofs ul { margin: 8px 0 0 16px; }
   `]
 })
-export class AppComponent implements OnDestroy {
+export class AppComponent implements OnDestroy, OnInit {
   @Input() placa?: string; // opcional: placa na marca d’água
   @ViewChild('video', { static: false }) videoRef!: ElementRef<HTMLVideoElement>;
   @ViewChild('canvas', { static: false }) canvasRef!: ElementRef<HTMLCanvasElement>;
@@ -54,8 +128,18 @@ export class AppComponent implements OnDestroy {
   now = new Date();
   token = Math.random().toString(36).slice(2, 8).toUpperCase();
   coords?: GeolocationCoordinates;
+  // Estado do score em tela
+  score: number | undefined;
+  scoreOk: boolean | undefined;
+  proofs: MobileContextProofs | undefined;
+
 
   constructor(private http: HttpClient) {}
+
+  ngOnInit() {
+    // Calcula score assim que a página carrega
+    this.avaliarMobile();
+  }
 
   ngOnDestroy() { this.fecharCamera(); }
 
@@ -63,11 +147,13 @@ export class AppComponent implements OnDestroy {
   // Fluxo público
   // =====================
 
-  iniciarCamera(): Observable<number> {
-    if (!this.preChecksOk()) return of();
-    return this.verificarCamerasDisponiveis$().pipe(
+  iniciarCamera(): Observable<void> {
+    if (!this.preChecksOk()) return of(void 0);
+    return this.calcularMobileScore$().pipe(
+      tap(({ score, ok, proofs }) => { this.score = score; this.scoreOk = ok; this.proofs = proofs; }),
+      switchMap(({ ok }) => ok ? this.verificarCamerasDisponiveis$() : of(false)),
       switchMap(tem => tem ? this.obterStreamComFallbacks$() : of(null)),
-      switchMap(stream => stream ? this.exibirStreamNoVideo(stream) : of()),
+      switchMap(stream => stream ? this.exibirStreamNoVideo(stream) : of(void 0)),
       tap(() => this.iniciarGeolocalizacao())
     );
   }
@@ -89,6 +175,15 @@ export class AppComponent implements OnDestroy {
       this.previewUrl = URL.createObjectURL(blob);
       this.enviarFoto(blob);
       this.capturando = false;
+    });
+  }
+
+  avaliarMobile() {
+    this.calcularMobileScore$().subscribe(({ score, ok, proofs }) => {
+      this.score = score;
+      this.scoreOk = ok;
+      this.proofs = proofs;
+      console.log('Mobile score:', score, proofs);
     });
   }
 
@@ -123,6 +218,85 @@ export class AppComponent implements OnDestroy {
         console.warn('enumerateDevices falhou (ignorável):', e);
         return of(true);
       })
+    );
+  }
+
+  // =====================
+  // Sinais individuais (JS puro)
+  // =====================
+
+  private getActiveCameraSettings(): { active: boolean; facingMode?: string; width?: number; height?: number } {
+    const track = this.stream?.getVideoTracks?.()[0];
+    const set = track?.getSettings?.();
+    return {
+      active: !!track,
+      facingMode: (set as any)?.facingMode,
+      width: set?.width,
+      height: set?.height,
+    };
+  }
+
+  private touchAndPointerProof() {
+    const touchOk = (navigator.maxTouchPoints || 0) > 0;
+    const coarsePointer = typeof window.matchMedia === 'function' ? window.matchMedia('(pointer: coarse)').matches : false;
+    return { touchOk, coarsePointer };
+  }
+
+  private vibrateSupportProof() {
+    return 'vibrate' in navigator;
+  }
+
+  private screenOrientationType() {
+    return (window.screen?.orientation as any)?.type as (string | undefined);
+  }
+
+  private connectionType() {
+    // Pode não existir em todos os navegadores
+    // @ts-ignore
+    return navigator.connection?.effectiveType as (string | undefined);
+  }
+
+  private requestDeviceOrientationPermission$(): Observable<boolean> {
+    // iOS precisa de permissão via gesto; outros ignoram
+    // @ts-ignore
+    const DOE = (window as any).DeviceOrientationEvent;
+    if (DOE && typeof DOE.requestPermission === 'function') {
+      return from(DOE.requestPermission() as Promise<string>).pipe(
+        map(res => res === 'granted'),
+        catchError(() => of(false))
+      );
+    }
+    // Em navegadores não-iOS, considerar ok tentar sem permissão explícita
+    return of(true);
+  }
+
+  private listenDeviceOrientationOnce$(): Observable<OrientationSample> {
+    return new Observable<OrientationSample>((sub) => {
+      const onEvt = (e: DeviceOrientationEvent) => {
+        sub.next({ alpha: e.alpha, beta: e.beta, gamma: e.gamma });
+        sub.complete();
+      };
+      const timeout = setTimeout(() => { sub.next(null); sub.complete(); }, 1200);
+      window.addEventListener('deviceorientation', onEvt, { once: true });
+      return () => { clearTimeout(timeout); window.removeEventListener('deviceorientation', onEvt as any); };
+    });
+  }
+
+  private getHighAccuracyPosition$(): Observable<{ ok: boolean; accuracy?: number }> {
+    if (!('geolocation' in navigator)) return of({ ok: false });
+    return new Observable<{ ok: boolean; accuracy?: number }>((sub) => {
+      const opts: PositionOptions = { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 };
+      const onOk = (pos: GeolocationPosition) => { sub.next({ ok: true, accuracy: pos.coords.accuracy }); sub.complete(); };
+      const onErr = () => { sub.next({ ok: false }); sub.complete(); };
+      navigator.geolocation.getCurrentPosition(onOk, onErr, opts);
+    });
+  }
+
+  private enumerateCameras$(): Observable<number> {
+    if (!navigator.mediaDevices?.enumerateDevices) return of(0);
+    return from(navigator.mediaDevices.enumerateDevices()).pipe(
+      map(devs => devs.filter(d => d.kind === 'videoinput').length),
+      catchError(() => of(0))
     );
   }
 
@@ -175,10 +349,63 @@ export class AppComponent implements OnDestroy {
   }
 
   // =====================
+  // Score agregando os sinais
+  // =====================
+  private calcularMobileScore$(): Observable<{ score: number; ok: boolean; proofs: MobileContextProofs }> {
+    const cam = this.getActiveCameraSettings();
+
+    // Fluxo de orientação: pedir permissão (se necessário) e ouvir 1 evento
+    const orientation$ = this.requestDeviceOrientationPermission$().pipe(
+      switchMap(ok => ok ? this.listenDeviceOrientationOnce$() : of(null)),
+      map(sample => ({ ok: !!(sample && (sample.alpha !== null || sample.beta !== null || sample.gamma !== null)), sample }))
+    );
+
+    const geo$ = this.getHighAccuracyPosition$();
+    const camsCount$ = this.enumerateCameras$();
+    const touch = this.touchAndPointerProof();
+    const vibrate = this.vibrateSupportProof();
+    const screenOri = this.screenOrientationType();
+    const conn = this.connectionType();
+
+    return forkJoin({ orientation: orientation$, geo: geo$, camsCount: camsCount$ }).pipe(
+      map(({ orientation, geo, camsCount }) => {
+        const proofs: MobileContextProofs = {
+          cameraActive: cam.active,
+          cameraFacingMode: cam.facingMode,
+          cameraResolution: { width: cam.width, height: cam.height },
+          orientationOk: orientation.ok,
+          orientationSample: orientation.sample,
+          touchOk: touch.touchOk,
+          coarsePointer: touch.coarsePointer,
+          geoOk: geo.ok,
+          geoAccuracy: geo.accuracy,
+          camerasCount: camsCount,
+          vibrateSupport: vibrate,
+          screenOrientation: screenOri,
+          connectionType: conn
+        };
+
+        // Pontuação (ajuste conforme política)
+        let score = 0;
+        if (proofs.cameraActive && (proofs.cameraFacingMode === 'environment' || (proofs.cameraResolution?.height || 0) >= (proofs.cameraResolution?.width || 0))) score += 2;
+        if (proofs.orientationOk) score += 1;
+        if (proofs.touchOk && proofs.coarsePointer) score += 1;
+        if (proofs.geoOk && (proofs.geoAccuracy ?? 999) < 70) score += 1; //  <70m
+        if ((proofs.camerasCount ?? 0) >= 2) score += 1;
+        if (proofs.vibrateSupport) score += 0.5;
+        if ((proofs.screenOrientation || '').includes('portrait')) score += 0.5;
+
+        const ok = score >= 4; // corte padrão
+        return { score, ok, proofs };
+      })
+    );
+  }
+
+  // =====================
   // 3) Exibição + geolocalização
   // =====================
 
-  exibirStreamNoVideo(stream: MediaStream): Observable<number> {
+  exibirStreamNoVideo(stream: MediaStream): Observable<void> {
     this.stream = stream;
     this.streamAtivo = true;
     return timer(0).pipe(
@@ -187,7 +414,8 @@ export class AppComponent implements OnDestroy {
         if (!videoEl) { console.warn('videoRef não disponível após streamAtivo=true'); return; }
         videoEl.srcObject = stream;
         this.now = new Date();
-      })
+      }),
+      map(() => void 0)
     );
   }
 
