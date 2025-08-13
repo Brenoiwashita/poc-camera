@@ -306,14 +306,16 @@ export class AppComponent implements OnDestroy, OnInit {
 
   private getTentativasConstraints(): MediaStreamConstraints[] {
     return [
-      { video: true, audio: false },
       { video: { facingMode: { ideal: 'environment' } }, audio: false },
-      { video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false }
+      { video: { facingMode: { exact: 'environment' } }, audio: false },
+      { video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false },
+      { video: true, audio: false }
     ];
   }
 
   private obterStreamComFallbacks$(): Observable<MediaStream | null> {
     const tries = this.getTentativasConstraints();
+
     const tryIndex = (i: number): Observable<MediaStream> => from(navigator.mediaDevices.getUserMedia(tries[i])).pipe(
       tap(() => console.log('getUserMedia OK com', tries[i])),
       catchError(err => {
@@ -321,8 +323,43 @@ export class AppComponent implements OnDestroy, OnInit {
         return i + 1 < tries.length ? tryIndex(i + 1) : throwError(() => err);
       })
     );
+
     return tryIndex(0).pipe(
+      // Se não veio traseira, tenta escolher explicitamente por deviceId da traseira
+      switchMap((stream) => {
+        const facing = stream.getVideoTracks?.()[0]?.getSettings?.()?.facingMode as (string | undefined);
+        if (facing === 'environment') return of(stream);
+        return this.selecionarDeviceIdTraseira$().pipe(
+          switchMap((deviceId) => {
+            if (!deviceId) return of(stream);
+            // fecha o stream anterior antes de trocar
+            try { stream.getTracks().forEach(t => t.stop()); } catch {}
+            const constraints: MediaStreamConstraints = { video: { deviceId: { exact: deviceId } as any }, audio: false };
+            return from(navigator.mediaDevices.getUserMedia(constraints)).pipe(
+              tap(() => console.log('Reabriu com deviceId traseiro')),
+              catchError(err => {
+                console.warn('Falhou reabrir com deviceId traseiro, mantendo stream anterior', err);
+                return of(stream);
+              })
+            );
+          })
+        );
+      }),
       catchError(err => { this.tratarErroGetUserMedia(err); return of(null); })
+    );
+  }
+
+  private selecionarDeviceIdTraseira$(): Observable<string | null> {
+    if (!navigator.mediaDevices?.enumerateDevices) return of(null);
+    return from(navigator.mediaDevices.enumerateDevices()).pipe(
+      map(devs => devs.filter(d => d.kind === 'videoinput')),
+      map(cams => {
+        // Tenta achar por label/back/rear/traseira/environment
+        const re = /(back|rear|traseira|environment)/i;
+        const encontrada = cams.find(c => re.test(c.label || ''));
+        return encontrada?.deviceId || null;
+      }),
+      catchError(() => of(null))
     );
   }
 
